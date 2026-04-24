@@ -6,110 +6,101 @@ import logging
 import os
 
 from dotenv import load_dotenv
-from telethon import TelegramClient
-from telethon.events import NewMessage, StopPropagation
-from telethon.tl.custom import Message
+from telethon import TelegramClient, events
 
 from utils import download_files, add_to_zip
 
 load_dotenv()
 
-API_ID = os.environ['API_ID']
-API_HASH = os.environ['API_HASH']
-BOT_TOKEN = os.environ['BOT_TOKEN']
-CONC_MAX = int(os.environ.get('CONC_MAX', 3))
-STORAGE = Path('./files/')
+# --- ENV ---
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-MessageEvent = NewMessage.Event | Message
+CONC_MAX = int(os.environ.get("CONC_MAX", 3))
 
+STORAGE = Path("./files")
+STORAGE.mkdir(exist_ok=True)
+
+# --- LOGGING ---
 logging.basicConfig(
     format='[%(levelname)s/%(asctime)s] %(name)s: %(message)s',
-    level=logging.INFO,
-    handlers=[
-        logging.StreamHandler(),
-    ]
+    level=logging.INFO
 )
 
-# dict to keep track of tasks for every user
+# user state
 tasks: dict[int, list[int]] = {}
 
+# --- CLIENT ---
 bot = TelegramClient(
-    'quick-zip-bot', api_id=API_ID, api_hash=API_HASH
+    "quick-zip-bot",
+    API_ID,
+    API_HASH
 ).start(bot_token=BOT_TOKEN)
 
 
-@bot.on(NewMessage(pattern='/add'))
-async def start_task_handler(event: MessageEvent):
-    """
-    Notifies the bot that the user is going to send the media.
-    """
+# --- HANDLERS ---
+
+@bot.on(events.NewMessage(pattern=r"^/add$"))
+async def add_handler(event):
     tasks[event.sender_id] = []
-
-    await event.respond('OK, send me some files.')
-
-    raise StopPropagation
+    await event.respond("OK, send me files now.")
 
 
-@bot.on(NewMessage(
-    func=lambda e: e.sender_id in tasks and e.file is not None))
-async def add_file_handler(event: MessageEvent):
-    """
-    Stores the ID of messages sended with files by this user.
-    """
+@bot.on(events.NewMessage(func=lambda e: e.sender_id in tasks and e.file))
+async def collect_files(event):
     tasks[event.sender_id].append(event.id)
 
-    raise StopPropagation
+
+@bot.on(events.NewMessage(pattern=r"^/zip (\w+)$"))
+async def zip_handler(event):
+    user_id = event.sender_id
+
+    if user_id not in tasks:
+        await event.respond("Use /add first.")
+        return
+
+    if not tasks[user_id]:
+        await event.respond("No files received.")
+        return
+
+    messages = await bot.get_messages(user_id, ids=tasks[user_id])
+
+    total_size = sum((m.file.size or 0) for m in messages if m.file)
+
+    if total_size > 2 * 1024 * 1024 * 1024:
+        await event.respond("Max size is 2GB.")
+        return
+
+    root = STORAGE / str(user_id)
+    root.mkdir(parents=True, exist_ok=True)
+
+    zip_name = root / f"{event.pattern_match.group(1)}.zip"
+
+    async for file in download_files(messages, CONC_MAX, root):
+        await get_running_loop().run_in_executor(
+            None,
+            partial(add_to_zip, zip_name, file)
+        )
+
+    await event.respond("Done!", file=str(zip_name))
+
+    await get_running_loop().run_in_executor(
+        None,
+        rmtree,
+        root
+    )
+
+    tasks.pop(user_id, None)
 
 
-@bot.on(NewMessage(pattern='/zip (?P<name>\w+)'))
-async def zip_handler(event: MessageEvent):
-    """
-    Zips the media of messages corresponding to the IDs saved for this user in
-    tasks. The zip filename must be provided in the command.
-    """
-    if event.sender_id not in tasks:
-        await event.respond('You must use /add first.')
-    elif not tasks[event.sender_id]:
-        await event.respond('You must send me some files first.')
-    else:
-        messages = await bot.get_messages(
-            event.sender_id, ids=tasks[event.sender_id])
-        zip_size = sum([m.file.size for m in messages])
-
-        if zip_size > 1024 * 1024 * 2000:   # zip_size > 1.95 GB approximately
-            await event.respond('Total filesize don\'t must exceed 2.0 GB.')
-        else:
-            root = STORAGE / f'{event.sender_id}/'
-            zip_name = root / (event.pattern_match['name'] + '.zip')
-
-            async for file in download_files(messages, CONC_MAX, root):
-                await get_running_loop().run_in_executor(
-                    None, partial(add_to_zip, zip_name, file))
-            
-            await event.respond('Done!', file=zip_name)
-
-            await get_running_loop().run_in_executor(
-                None, rmtree, STORAGE / str(event.sender_id))
-
-        tasks.pop(event.sender_id)
-
-    raise StopPropagation
+@bot.on(events.NewMessage(pattern=r"^/cancel$"))
+async def cancel_handler(event):
+    tasks.pop(event.sender_id, None)
+    await event.respond("Canceled.")
 
 
-@bot.on(NewMessage(pattern='/cancel'))
-async def cancel_handler(event: MessageEvent):
-    """
-    Cleans the list of tasks for the user.
-    """
-    try:
-        tasks.pop(event.sender_id)
-    except KeyError:
-        pass
-
-    await event.respond('Canceled zip. For a new one, use /add.')
-
-    raise StopPropagation
-
-
-if __name__ == '__main__':
+# --- START ---
+if __name__ == "__main__":
+    print("Bot is running...")
     bot.run_until_disconnected()
